@@ -367,7 +367,6 @@ class CollIndexOperator(BaseOperator):
         """get index filename for storage"""
         storage_path = org.storage.get_storage_extra_path(str(org.id))
         filename = storage_path + f"dedupe-index/{coll_id}.rdb"
-
         return filename
 
     async def check_redis_saved(
@@ -377,8 +376,7 @@ class CollIndexOperator(BaseOperator):
         status: CollIndexStatus,
         data: MCSyncData,
     ):
-        """create sync job to save redis index data to s3 storage"""
-
+        """create configmap for import job, lookup resources only on first init"""
         redis_pod = data.children[POD].get(redis_name)
         if redis_pod and redis_pod["status"].get("phase") == "Succeeded":
             finished_at = None
