@@ -66,7 +66,20 @@ class CollIndexOperator(BaseOperator):
         self.shared_params["cpu"] = self.shared_params["redis_cpu"]
         self.shared_params["obj_type"] = "coll"
 
-        self.shared_params["local_file"] = "dump.rdb"
+        self.is_kvrocks = True
+
+        if self.is_kvrocks:
+            self.shared_params["local_file_src"] = "backup"
+            self.shared_params["local_file_dest"] = "db"
+        else:
+            self.shared_params["local_file_src"] = "dump.rdb"
+            self.shared_params["local_file_dest"] = "dump.rdb"
+
+        if self.is_kvrocks:
+            self.shared_params["redis_image"] = "apache/kvrocks:latest"
+            self.pod_yaml = "kvrocks.yaml"
+        else:
+            self.pod_yaml = "redis.yaml"
 
         self.fast_retry = int(os.environ.get("FAST_RETRY_SECS") or 0)
 
@@ -141,8 +154,7 @@ class CollIndexOperator(BaseOperator):
                 # Saving process
                 # 1. run bgsave while redis is active
                 if not skip_redis:
-                    if status.state != "saving":
-                        await self.do_redis_save(spec.id, status)
+                    await self.do_redis_save(spec.id, status)
 
                 # 2. once redis has shutdown, check if fully finished
                 else:
@@ -257,15 +269,36 @@ class CollIndexOperator(BaseOperator):
     async def do_redis_save(self, coll_id: UUID, status: CollIndexStatus):
         """shutdown save redis"""
         try:
+            if status.state != "saving":
+                if not self.is_kvrocks:
+                    return
+
             redis = await self.k8s.get_redis_connected("coll-" + str(coll_id))
-            if redis:
+            if not redis:
+                return
+
+            if status.state != "saving":
                 await self.set_state("saving", status, coll_id)
-                self.run_task(self.do_redis_shutdown(redis, coll_id, status))
+
+                if self.is_kvrocks:
+                    await redis.bgsave(False)
+                else:
+                    self.run_task(self.do_redis_shutdown(redis, coll_id, status))
+
+            if self.is_kvrocks:
+                if await self.is_bgsave_done(redis):
+                    await redis.shutdown()
 
         # pylint: disable=broad-exception-caught
-        except Exception as e:
-            print(e)
+        except Exception:
+            await self.set_state("ready", status, coll_id)
             traceback.print_exc()
+
+    async def is_bgsave_done(self, redis: Redis) -> bool:
+        """return true if bgsave has successfully finished"""
+        info = await redis.execute_command("INFO persistence")
+
+        return "bgsave_in_progress:0" in info and "last_bgsave_status:ok" in info
 
     async def do_redis_shutdown(
         self, redis: Redis, coll_id: UUID, status: CollIndexStatus
@@ -369,14 +402,12 @@ class CollIndexOperator(BaseOperator):
             spec.id, org
         )
 
-        return self.load_from_yaml("redis.yaml", params)
+        return self.load_from_yaml(self.pod_yaml, params)
 
     def get_index_storage_filename(self, coll_id: UUID, org: Organization):
         """get index filename for storage"""
         storage_path = org.storage.get_storage_extra_path(str(org.id))
-        filename = storage_path + f"dedupe-index/{coll_id}.rdb"
-
-        return filename
+        return storage_path + f"dedupe-index/{coll_id}"
 
     async def check_redis_saved(
         self,
@@ -420,14 +451,19 @@ class CollIndexOperator(BaseOperator):
         hash_ = ""
         size = -1
         logs = await self.k8s.get_pod_logs(
-            pod_name, container=self.rclone_save, lines=10
+            pod_name, container=self.rclone_save, lines=100
         )
-        m = re.search(r"md5 = ([^\s]+) OK", logs)
-        if m:
-            hash_ = "md5:" + m.group(1)
-        m = re.search(r"size = ([\d]+) OK", logs)
+        # m = re.search(r"md5 = ([^\s]+) OK", logs)
+        # if m:
+        #    hash_ = "md5:" + m.group(1)
+        # m = re.search(r"size = ([\d]+) OK", logs)
+        # if m:
+        #    size = int(m.group(1))
+
+        m = re.search(r"([\d]+),([^,]+)," + str(coll_id), logs)
         if m:
             size = int(m.group(1))
+            hash_ = "md5:" + m.group(2)
 
         print("UPLOAD LOGS")
         print("-----------")
